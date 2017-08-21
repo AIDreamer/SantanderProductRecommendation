@@ -1,0 +1,178 @@
+---
+title: "Sample Run"
+author: "Son Pham"
+date: "December 9, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+my.install <- function(pkg) {
+ if (!(pkg %in% installed.packages()[,1])) {
+ install.packages(pkg)
+ }
+ return (require(pkg,character.only=TRUE))
+}
+my.install("stringr")
+my.install("caret")
+my.install("e1071")
+my.install("rpart")
+my.install("tidyr")
+my.install("xgboost")
+```
+
+# Sample run
+
+We realize that the original note book can be very difficult and inconvenient for Professor King to evaluate. Therefore, we decided to make a Sample Run folder to make it easier for Professor King to run our notebook and also help us reorganize our Markdown for future submission.
+
+## Step 1: Pre-processing data
+
+As demonstrated, we only take data from Jan to May 2015 as our training data and use products added in June 2015 as our labels. We then use data from Jan to May 2016 as our testing data, which will then be tested on Kaggle. We decided not to write our own validation since we think Kaggle score is already a good measure for our performance, but it is something we will consider when our 5 submissions / day limit gets quickly used up.
+
+We assume that the data is already being processed. We will load the data here
+
+```{r}
+load("./Sample Run/train_data.Rda")
+load("./Sample Run/train_labels.Rda")
+load("./Sample Run/test_data.Rda")
+```
+
+Drop column list shows which attributes will be dropped and not affected during the training process
+
+```{r}
+Drop_Column_List = c("customer_code", "last_date_as_primary", "foreigner_index", "date_begin_contract", "join_channel", "country", "province_name", "customer_type_begin_month_1", "customer_type_begin_month_2", "customer_type_begin_month_3", "customer_type_begin_month_4", "customer_type_begin_month_5")
+
+# Drop these attributes from both train_data and test_data
+train_data2 = train_data[, !(names(train_data) %in% Drop_Column_List)]
+test_data2 = test_data[, !(names(test_data) %in% Drop_Column_List)]
+```
+
+## Step 2: Model strategy
+
+Since we have 24 different products in play, we will use one-vs-all strategy, meaning that we will build prediction model for each product. Thus, we need to create 24 different train_data, each with respective product labels.
+
+```{r}
+# List of all product attributes
+product_attributes = c("Saving_Account", "Guarantees", "Current_Accounts", "Derivada_Account", "Payroll_Account", "Junior_Account", "Mas_Particular_Account", "Particular_Account", "Particular_Plus_Account", "Short_Term_Deposits", "Medium_Term_Deposits", "Long_Term_Deposite", "E_Account", "Funds", "Mortgage", "Pensions_1", "Loans", "Taxes", "Credit_Card", "Securities", "Home_Account", "Payroll", "Pensions_2", "Direct_Debit")
+
+# Create all training data
+trainList = list()
+for (i in 1:length(product_attributes)) {
+  train = train_data2
+  train$train_labels = as.numeric(train_labels[[product_attributes[i]]])
+  trainList[[i]] = train
+}
+```
+
+Now that we have 24 separate training sets and labels for each data set, we can use this train our model using XGBoost.
+
+```{r}
+set.seed(100)
+pmt = proc.time()
+modelList = list()
+for (i in 1:length(product_attributes)) {
+  print(product_attributes[i])
+  df_train = trainList[[i]]
+  y = df_train$train_labels
+  df_train = df_train[-grep('train_labels', colnames(df_train))]
+  
+  if (sum(y) != 0) {
+    model = xgboost(data = as.matrix(df_train), 
+            label = y, 
+            eta = 0.05,
+            max_depth = 5, 
+            nround=100, 
+            subsample = 1,
+            colsample_bytree = 1,
+            seed = 100,
+            eval_metric = "logloss",
+            objective = "binary:logistic",
+            num_class = 1,
+            missing = NaN,
+            silent = 1
+          )
+    modelList[[i]] = model
+  }
+}
+show(proc.time() - pmt)
+```
+
+We should now have 24 separate models. Use each of this to predict the probability that a person will add each product.
+
+```{r}
+pmt = proc.time()
+predList = list()
+empty_df = data.frame(x = rep(0, times = nrow(test_data2)))
+rownames(empty_df) = rownames(test_data2)
+df_test = as.matrix(test_data2)
+
+for (i in 1:length(product_attributes)) {
+  print(product_attributes[i])
+  if (is.null(modelList[[i]])) {
+    predList[[i]] = empty_df
+  } else {
+    y_pred <- predict(modelList[[i]], df_test, missing=NaN)
+    # Assign pred to pred list
+    predList[[i]] = data.frame(y = y_pred)
+  }
+  colnames(predList[[i]]) = c(product_attributes[i])
+}
+
+pred_df = do.call(cbind, predList)
+pred_df$customer_code = test_data$customer_code
+show(proc.time() - pmt)
+```
+
+Now we have a 929615 x 24 dataframe, each row of which contains a list of 24 probabilities representing how likely that respective product will be added by the customer. However, this hasn't been accounted for the products that the users already owned. We need to remove all likelihood of products that the users already owned by cutting the probabilities of those product down to 0.
+
+Let's first construct another 929615 x 24 data frame representing products that the users already have.
+
+```{r}
+# List of products already owned
+productList = list()
+
+# Gather all products in May 2016
+for (i in 1:length(product_attributes)) {
+  column_name = paste(product_attributes[[i]],"5",sep = "_")
+  productList[[i]] = data.frame(y = test_data2[[column_name]])
+  colnames(productList[[i]]) = c(product_attributes[i])
+}
+
+# Combine them into one single data frame
+product_df = do.call(cbind, productList)
+```
+
+Now slash all probabilities of products already owned down to 0
+
+```{r}
+# Copy pred_df
+pred_df2 = pred_df
+
+# Slash all probabilities of products already owned down to 0
+for (i in 1:length(product_attributes)) {
+  prod = product_attributes[i]
+  pred_df2[as.logical(product_df[[prod]]), prod] = 0
+}
+```
+
+Select Top7 and output to submission
+
+```{r}
+# Product name in Spanish
+product_names_es = c("ind_ahor_fin_ult1","ind_aval_fin_ult1","ind_cco_fin_ult1","ind_cder_fin_ult1","ind_cno_fin_ult1","ind_ctju_fin_ult1","ind_ctma_fin_ult1","ind_ctop_fin_ult1","ind_ctpp_fin_ult1","ind_deco_fin_ult1","ind_deme_fin_ult1","ind_dela_fin_ult1","ind_ecue_fin_ult1","ind_fond_fin_ult1","ind_hip_fin_ult1","ind_plan_fin_ult1","ind_pres_fin_ult1","ind_reca_fin_ult1","ind_tjcr_fin_ult1","ind_valo_fin_ult1","ind_viv_fin_ult1","ind_nomina_ult1","ind_nom_pens_ult1","ind_recibo_ult1")
+
+# This function get the top 7 products and output them as strings in Spanish (to obey Kaggle law)
+getTop7 = function(x) {
+  colIndex = tail( order(x[1:24]), 7 )
+  paste(product_names_es[colIndex], collapse = ' ')
+}
+top7 = apply(pred_df2, 1, getTop7)
+```
+
+Output the prediction
+
+```{r}
+submit_df = data.frame(ncodpers = pred_df2$customer_code, added_products = top7)
+write.csv(submit_df, file="Sample Run/submission.csv", row.names = FALSE)
+```
